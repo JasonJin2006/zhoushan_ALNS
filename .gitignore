@@ -38,7 +38,6 @@ env/
 Thumbs.db
 
 # Project specific
-output/
 *.xlsx
 *.json
 !input/*.xlsx
