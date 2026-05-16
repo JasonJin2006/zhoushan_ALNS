@@ -7,6 +7,7 @@
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+from functools import lru_cache
 
 from ..map_data import MapData, GeoCoord, get_map_data, horizontal_distance_meters
 from ..cruise_ship import (
@@ -110,6 +111,7 @@ class SolutionEvaluator:
         self.cruise = get_cruise_route()
         self.predictor = get_rendezvous_predictor()
         self.land_airports = [ap.name for ap in self.map_data.get_land_airports()]
+        self._eval_cache: Dict[int, Tuple[bool, float]] = {}
 
     def evaluate(self, solution: Solution) -> EvalResult:
         """
@@ -311,10 +313,15 @@ class SolutionEvaluator:
             # ========== 阶段3: 原地leg处理（换电或无飞行） ==========
             if leg.from_location == leg.to_location and leg.flight_distance_km == 0:
                 if leg.swap_battery:
-                    battery = 100.0
-                    current_time += DRONE_SWAP_TIME_SECONDS
-                    swap_count += 1
-                    leg.battery_after = 100.0
+                    if location in self.land_airports:
+                        battery = 100.0
+                        current_time += DRONE_SWAP_TIME_SECONDS
+                        swap_count += 1
+                        leg.battery_after = 100.0
+                    else:
+                        violations.append(f"换电只能在陆地机场: {location} 不可换电")
+                        feasible = False
+                        leg.battery_after = battery
                 else:
                     leg.battery_after = battery
                 leg.arrive_time = current_time
@@ -399,7 +406,8 @@ class SolutionEvaluator:
                     battery = 100.0
                     swap_count += 1
                 else:
-                    leg.swap_battery = False
+                    violations.append(f"换电只能在陆地机场: {location} 不可换电")
+                    feasible = False
         
         return {
             "feasible": feasible,
@@ -551,3 +559,20 @@ class SolutionEvaluator:
         # 10. 最终评分
         score = expected_income - flight_cost - risk_penalty
         return score
+
+    def quick_evaluate(self, solution: Solution) -> Tuple[bool, float]:
+        """
+        快速评估：只返回是否可行和净利润，不做完整模拟。
+        用于修复算子中大量候选解的快速筛选。
+        """
+        solution_hash = hash(solution.assigned_order_ids())
+        if solution_hash in self._eval_cache:
+            return self._eval_cache[solution_hash]
+
+        result = self.evaluate(solution)
+        self._eval_cache[solution_hash] = (result.feasible, result.net_profit)
+        return (result.feasible, result.net_profit)
+
+    def clear_cache(self):
+        """清除评估缓存"""
+        self._eval_cache.clear()

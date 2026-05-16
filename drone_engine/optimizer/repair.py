@@ -202,27 +202,25 @@ def compute_insertion_profit(
     leg_index: int,
     order_manager: OrderManager,
     evaluator: SolutionEvaluator,
+    quick_only: bool = False,
 ) -> Tuple[float, Optional[Solution]]:
     """
     估算将订单插入到指定位置后的利润。
 
     改进: 使用模拟位置而非leg.from_location（修复destroy后元数据不一致问题）。
 
-    返回: (利润, 试探解) 或 (负无穷, None)
+    quick_only=True时，只做快速筛选，返回(-inf, None)如果不可行，
+    不做完整评估。用于大量候选的快速筛选。
     """
-    trial = solution.deep_copy()
-    plan = trial.drone_plans[drone_id]
-
-    if leg_index >= len(plan.legs):
+    plan = solution.drone_plans.get(drone_id)
+    if plan is None or leg_index >= len(plan.legs):
         return float("-inf"), None
 
     leg = plan.legs[leg_index]
 
-    # 获取该leg开始前的实际位置
     positions = _simulate_positions(plan)
     actual_pos = positions[leg_index]
 
-    # 检查载重
     current_payload = sum(
         order_manager.orders[oid].weight_kg
         for oid in leg.load_orders
@@ -231,26 +229,33 @@ def compute_insertion_profit(
     if current_payload + order.weight_kg > DRONE_MAX_PAYLOAD_KG:
         return float("-inf"), None
 
-    # 检查供应地（使用实际位置）
     if actual_pos != order.supply_location:
         return float("-inf"), None
 
-    # 检查需求地：是否有后续leg到达需求地
     demand_leg_found = False
     for j in range(leg_index, len(plan.legs)):
         if plan.legs[j].to_location == order.demand_location:
             demand_leg_found = True
-            plan.legs[j].unload_orders.append(order.order_id)
             break
 
     if not demand_leg_found:
         return float("-inf"), None
 
-    # 添加装货
-    leg.load_orders.append(order.order_id)
+    if quick_only:
+        return (0.0, None)
+
+    trial = solution.deep_copy()
+    trial_plan = trial.drone_plans[drone_id]
+    trial_leg = trial_plan.legs[leg_index]
+
+    for j in range(leg_index, len(trial_plan.legs)):
+        if trial_plan.legs[j].to_location == order.demand_location:
+            trial_plan.legs[j].unload_orders.append(order.order_id)
+            break
+
+    trial_leg.load_orders.append(order.order_id)
     trial.unassigned_order_ids.discard(order.order_id)
 
-    # 重新评估
     result = evaluator.evaluate(trial)
     if not result.feasible:
         return float("-inf"), None
@@ -300,6 +305,7 @@ def try_insert_as_new_trip(
         current_battery = end_battery
 
         # === Phase 1: 飞到供应地 ===
+        first_leg = None
         if current_loc != supply:
             leg, t, bat = _make_flight_leg(
                 current_loc,
@@ -315,6 +321,7 @@ def try_insert_as_new_trip(
             if leg is None or t > SIMULATION_DURATION_SECONDS:
                 continue
             legs_to_add.append(leg)
+            first_leg = leg
             current_time = t
             current_battery = bat
             current_loc = supply
@@ -323,18 +330,21 @@ def try_insert_as_new_trip(
         if order.generation_time_seconds > current_time:
             current_time = order.generation_time_seconds
 
-        # === Phase 2: 装载订单（原地leg） ===
-        load_leg = FlightLeg(
-            from_location=current_loc,
-            to_location=current_loc,
-            load_orders=[order.order_id],
-            depart_time=current_time,
-            arrive_time=current_time,
-            flight_distance_km=0.0,
-            battery_before=current_battery,
-            battery_after=current_battery,
-        )
-        legs_to_add.append(load_leg)
+        # === Phase 2: 装载订单（合并到第一个leg） ===
+        # 注意：不创建单独的装货leg，因为scheduler会跳过 from==to 的leg
+        # 改为把load_orders合并到飞往供应地的leg
+        if first_leg is None:
+            first_leg = FlightLeg(
+                from_location=current_loc,
+                to_location=current_loc,
+                depart_time=current_time,
+                arrive_time=current_time,
+                flight_distance_km=0.0,
+                battery_before=current_battery,
+                battery_after=current_battery,
+            )
+            legs_to_add.append(first_leg)
+        first_leg.load_orders.append(order.order_id)
 
         # === Phase 3: 飞到需求地 ===
         delivery_leg, t, bat = _make_flight_leg(
@@ -360,7 +370,8 @@ def try_insert_as_new_trip(
         land_airports = [ap.name for ap in map_data.get_land_airports()]
         if current_battery < BATTERY_RETURN_THRESHOLD and current_time < SIMULATION_DURATION_SECONDS - 300:
             if current_loc in land_airports:
-                delivery_leg.swap_battery = True
+                if legs_to_add and legs_to_add[-1].to_location == current_loc:
+                    legs_to_add[-1].swap_battery = True
             elif current_loc != "游轮":
                 try:
                     nearest, _ = map_data.find_nearest_land_airport(current_loc)
@@ -470,23 +481,27 @@ class GreedyInsertion(RepairOperator):
         )
 
         for order in orders_to_insert:
-            best_profit = current_profit
-            best_trial = None
-
-            # 概率跳过piggyback（增加多样性）
             use_piggyback = random.random() < self.piggyback_prob
 
             if use_piggyback:
+                candidates = []
                 for drone_id, plan in current_sol.drone_plans.items():
                     for i in range(len(plan.legs)):
-                        profit, trial = compute_insertion_profit(
-                            current_sol, order, drone_id, i, order_manager, evaluator
+                        profit, _ = compute_insertion_profit(
+                            current_sol, order, drone_id, i, order_manager, evaluator, quick_only=True
                         )
-                        if profit > best_profit and trial is not None:
-                            best_profit = profit
-                            best_trial = trial
+                        if profit > float("-inf"):
+                            candidates.append((drone_id, i))
 
-            # 总是尝试new trip
+                for drone_id, i in candidates[:5]:
+                    profit, trial = compute_insertion_profit(
+                        current_sol, order, drone_id, i, order_manager, evaluator, quick_only=False
+                    )
+                    if profit > current_profit and trial is not None:
+                        current_sol = trial
+                        current_profit = profit
+                        break
+
             new_trip_trial = try_insert_as_new_trip(
                 current_sol,
                 order,
@@ -498,13 +513,9 @@ class GreedyInsertion(RepairOperator):
             )
             if new_trip_trial is not None:
                 result = evaluator.evaluate(new_trip_trial)
-                if result.feasible and result.net_profit > best_profit:
-                    best_trial = new_trip_trial
-                    best_profit = result.net_profit
-
-            if best_trial is not None:
-                current_sol = best_trial
-                current_profit = best_profit
+                if result.feasible and result.net_profit > current_profit:
+                    current_sol = new_trip_trial
+                    current_profit = result.net_profit
 
         return current_sol
 
@@ -544,6 +555,10 @@ class Regret2Insertion(RepairOperator):
                 if order.is_deliverable_at(0):
                     orders_to_insert.append(order)
 
+        orders_to_insert.sort(key=lambda o: -o.full_income)
+        orders_to_insert = orders_to_insert[:10]
+        max_iterations = 10
+
         current_sol = solution.deep_copy()
         base_result = evaluator.evaluate(current_sol)
         current_profit = (
@@ -551,19 +566,32 @@ class Regret2Insertion(RepairOperator):
         )
         remaining = list(orders_to_insert)
 
-        while remaining:
-            best_insertions = {}
+        iteration_count = 0
+        while remaining and iteration_count < max_iterations:
+            iteration_count += 1
+            quick_insertions = {}
+            full_insertions = {}
 
             for order in remaining:
-                insertions = []
-
+                candidates = []
                 for drone_id, plan in current_sol.drone_plans.items():
                     for i in range(len(plan.legs)):
-                        profit, trial = compute_insertion_profit(
-                            current_sol, order, drone_id, i, order_manager, evaluator
+                        profit, _ = compute_insertion_profit(
+                            current_sol, order, drone_id, i, order_manager, evaluator, quick_only=True
                         )
-                        if trial is not None:
-                            insertions.append((profit, trial))
+                        if profit > float("-inf"):
+                            candidates.append((drone_id, i, profit))
+
+                candidates.sort(key=lambda x: -x[2])
+                quick_insertions[order.order_id] = candidates[:5]
+
+                insertions = []
+                for drone_id, i, _ in candidates[:5]:
+                    profit, trial = compute_insertion_profit(
+                        current_sol, order, drone_id, i, order_manager, evaluator, quick_only=False
+                    )
+                    if trial is not None:
+                        insertions.append((profit, trial))
 
                 new_trip = try_insert_as_new_trip(
                     current_sol,
@@ -580,7 +608,7 @@ class Regret2Insertion(RepairOperator):
                         insertions.append((result.net_profit, new_trip))
 
                 insertions.sort(key=lambda x: -x[0])
-                best_insertions[order.order_id] = insertions
+                full_insertions[order.order_id] = insertions
 
             best_order = None
             best_regret = -1
@@ -588,11 +616,11 @@ class Regret2Insertion(RepairOperator):
             best_profit_for_order = current_profit
 
             for order in remaining:
-                insertions = best_insertions.get(order.order_id, [])
+                insertions = full_insertions.get(order.order_id, [])
                 if len(insertions) >= 2:
                     regret = insertions[0][0] - insertions[1][0]
                 elif len(insertions) == 1:
-                    regret = insertions[0][0]  # 只有1个选择 → 很迫切
+                    regret = insertions[0][0]
                 else:
                     regret = float("-inf")
 
@@ -650,6 +678,10 @@ class Regret3Insertion(RepairOperator):
                 if order.is_deliverable_at(0):
                     orders_to_insert.append(order)
 
+        orders_to_insert.sort(key=lambda o: -o.full_income)
+        orders_to_insert = orders_to_insert[:10]
+        max_iterations = 10
+
         current_sol = solution.deep_copy()
         base_result = evaluator.evaluate(current_sol)
         current_profit = (
@@ -657,22 +689,32 @@ class Regret3Insertion(RepairOperator):
         )
         remaining = list(orders_to_insert)
 
-        while remaining:
-            best_order = None
-            best_regret = -1
-            best_trial = None
-            best_trial_profit = current_profit
+        iteration_count = 0
+        while remaining and iteration_count < max_iterations:
+            iteration_count += 1
+            quick_insertions = {}
+            full_insertions = {}
 
             for order in remaining:
-                insertions = []
-
+                candidates = []
                 for drone_id, plan in current_sol.drone_plans.items():
                     for i in range(len(plan.legs)):
-                        profit, trial = compute_insertion_profit(
-                            current_sol, order, drone_id, i, order_manager, evaluator
+                        profit, _ = compute_insertion_profit(
+                            current_sol, order, drone_id, i, order_manager, evaluator, quick_only=True
                         )
-                        if trial is not None:
-                            insertions.append((profit, trial))
+                        if profit > float("-inf"):
+                            candidates.append((drone_id, i, profit))
+
+                candidates.sort(key=lambda x: -x[2])
+                quick_insertions[order.order_id] = candidates[:5]
+
+                insertions = []
+                for drone_id, i, _ in candidates[:5]:
+                    profit, trial = compute_insertion_profit(
+                        current_sol, order, drone_id, i, order_manager, evaluator, quick_only=False
+                    )
+                    if trial is not None:
+                        insertions.append((profit, trial))
 
                 new_trip = try_insert_as_new_trip(
                     current_sol,
@@ -689,6 +731,15 @@ class Regret3Insertion(RepairOperator):
                         insertions.append((result.net_profit, new_trip))
 
                 insertions.sort(key=lambda x: -x[0])
+                full_insertions[order.order_id] = insertions
+
+            best_order = None
+            best_regret = -1
+            best_trial = None
+            best_trial_profit = current_profit
+
+            for order in remaining:
+                insertions = full_insertions.get(order.order_id, [])
 
                 if len(insertions) >= 3:
                     regret = insertions[0][0] - insertions[2][0]
@@ -821,6 +872,7 @@ class BatchNewTripInsertion(RepairOperator):
             current_battery = end_battery
 
             # 飞到供应地
+            first_leg = None
             if current_loc != supply:
                 leg, t, bat = _make_flight_leg(
                     current_loc,
@@ -836,6 +888,7 @@ class BatchNewTripInsertion(RepairOperator):
                 if leg is None or t > SIMULATION_DURATION_SECONDS:
                     continue
                 legs_to_add.append(leg)
+                first_leg = leg
                 current_time = t
                 current_battery = bat
                 current_loc = supply
@@ -859,18 +912,21 @@ class BatchNewTripInsertion(RepairOperator):
             if not loaded:
                 continue
 
-            # 装载（原地leg）
-            load_leg = FlightLeg(
-                from_location=current_loc,
-                to_location=current_loc,
-                load_orders=[o.order_id for o in loaded],
-                depart_time=current_time,
-                arrive_time=current_time,
-                flight_distance_km=0.0,
-                battery_before=current_battery,
-                battery_after=current_battery,
-            )
-            legs_to_add.append(load_leg)
+            # 装载（合并到第一个leg，不创建单独的装货leg）
+            # 注意：scheduler会跳过 from==to 的leg，所以必须合并到飞行leg
+            load_order_ids = [o.order_id for o in loaded]
+            if first_leg is None:
+                first_leg = FlightLeg(
+                    from_location=current_loc,
+                    to_location=current_loc,
+                    depart_time=current_time,
+                    arrive_time=current_time,
+                    flight_distance_km=0.0,
+                    battery_before=current_battery,
+                    battery_after=current_battery,
+                )
+                legs_to_add.append(first_leg)
+            first_leg.load_orders.extend(load_order_ids)
 
             # 按需求地分组，最近邻路线
             demand_map: Dict[str, List[Order]] = {}
@@ -923,8 +979,9 @@ class BatchNewTripInsertion(RepairOperator):
                 current_battery < BATTERY_RETURN_THRESHOLD
                 and current_time < SIMULATION_DURATION_SECONDS - 300
             ):
-                if current_loc in land_airports and legs_to_add:
-                    legs_to_add[-1].swap_battery = True
+                if current_loc in land_airports:
+                    if legs_to_add and legs_to_add[-1].to_location == current_loc:
+                        legs_to_add[-1].swap_battery = True
                 elif current_loc != "游轮":
                     try:
                         nearest, _ = map_data.find_nearest_land_airport(current_loc)

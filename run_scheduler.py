@@ -422,8 +422,10 @@ def export_assigned_orders(result: Dict, order_manager, filepath: str):
     assigned_order_ids = set()
     for drone_actions in result.get("actions", {}).values():
         for action in drone_actions:
-            load_orders = action.get("load_orders", []) if isinstance(action, dict) else getattr(action, "load_orders", [])
-            for oid in load_orders:
+            # 从unload_orders（降落时卸载的订单）统计已分配订单
+            # 这些是真正被成功送达的订单
+            unload_orders = action.get("unload_orders", []) if isinstance(action, dict) else getattr(action, "unload_orders", [])
+            for oid in unload_orders:
                 assigned_order_ids.add(oid)
     
     unassigned = set(order_manager.orders.keys()) - assigned_order_ids
@@ -704,12 +706,15 @@ def export_details(result: Dict, filepath: str, order_manager=None):
     delivery_times = {}
     for drone_actions in result.get("actions", {}).values():
         for action in drone_actions:
-            load_orders = action.get("load_orders", []) if isinstance(action, dict) else getattr(action, "load_orders", [])
-            for oid in load_orders:
+            # 从unload_orders（降落时卸载的订单）统计已分配订单
+            unload_orders = action.get("unload_orders", []) if isinstance(action, dict) else getattr(action, "unload_orders", [])
+            for oid in unload_orders:
                 assigned_order_ids.add(oid)
-            if action.get("action_type") == "landing" or (isinstance(action, dict) and action.get("action_type") == "landing"):
-                unload_orders = action.get("unload_orders", [])
-                time_seconds = action.get("time_seconds", 0)
+            
+            # 记录送达时间
+            action_type = action.get("action_type") if isinstance(action, dict) else getattr(action, "action_type", None)
+            if action_type == "landing":
+                time_seconds = action.get("time_seconds", 0) if isinstance(action, dict) else getattr(action, "time_seconds", 0)
                 for oid in unload_orders:
                     if oid not in delivery_times:
                         delivery_times[oid] = time_seconds
@@ -840,7 +845,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-orders", type=int, default=600, help="初始解最大分配订单数（默认: 600）"
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="快速测试模式（迭代=200, 时间限制=30秒）",
+    )
     args = parser.parse_args()
+
+    # 快速测试模式覆盖
+    if args.fast:
+        args.iterations = 200
+        args.time_limit = 30.0
 
     try:
         run(

@@ -328,7 +328,16 @@ class GreedyConstructor:
                 t, bat, loc = t_new, bat_new, loc_new
 
         elif bat < BATTERY_SWAP_THRESHOLD and loc in self.land_airports and (sim_end - t) > 600:
-            # 在当前陆地机场换电：不需要额外的leg，只需要更新状态
+            swap_leg = FlightLeg(
+                from_location=loc,
+                to_location=loc,
+                swap_battery=True,
+                depart_time=t,
+                arrive_time=t,
+                battery_before=bat,
+                battery_after=100.0,
+            )
+            legs.append(swap_leg)
             t += DRONE_SWAP_TIME_SECONDS
             bat = 100.0
             state.available_time = t

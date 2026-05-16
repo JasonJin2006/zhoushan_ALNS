@@ -208,18 +208,55 @@ class Solution:
         )
 
     def clean_empty_legs(self):
-        """移除没有订单的空飞行段（保留换电段）"""
+        """
+        清理空leg，但保持无人机位置连续性。
+        
+        策略：
+        - 完全空的leg（无订单、无换电、无飞行）才删除
+        - 有飞行的空leg保留作为"纯移动leg"
+        - 确保相邻leg之间位置连续
+        """
         for plan in self.drone_plans.values():
+            if not plan.legs:
+                continue
+            
+            # 第一遍：标记要删除的leg
+            to_remove = set()
+            for i, leg in enumerate(plan.legs):
+                # 只有完全无意义的leg才标记删除
+                # 即：原地 + 无订单 + 无换电
+                if (not leg.is_flying and 
+                    not leg.has_orders() and 
+                    not leg.swap_battery):
+                    to_remove.add(i)
+            
+            # 第二遍：构建新的legs列表，同时检查位置连续性
             cleaned = []
-            for leg in plan.legs:
-                # 纯换电leg保留（只有swap_battery为True）
-                if leg.swap_battery and not leg.load_orders and not leg.unload_orders:
-                    cleaned.append(leg)
+            current_location = plan.initial_location
+            
+            for i, leg in enumerate(plan.legs):
+                if i in to_remove:
                     continue
-                # 有任何订单的leg保留（load或unload）
-                if leg.has_orders():
-                    cleaned.append(leg)
-                    continue
-                # 其他空leg全部跳过（不需要保留用于状态转移）
-                # 这样可以避免生成无效的空载飞行
+                
+                # 如果leg的起点和当前位置不一致，说明中间有空leg被删除了
+                # 需要修正leg的起点或插入移动leg
+                if leg.is_flying and leg.from_location != current_location:
+                    # 创建一个纯移动leg来填补空缺
+                    move_leg = FlightLeg(
+                        from_location=current_location,
+                        to_location=leg.from_location,
+                        load_orders=[],
+                        unload_orders=[],
+                        swap_battery=False,
+                        depart_time=0.0,  # 占位，由evaluator重新计算
+                        arrive_time=0.0,
+                        flight_distance_km=0.0,
+                        battery_before=0.0,
+                        battery_after=0.0,
+                    )
+                    cleaned.append(move_leg)
+                
+                cleaned.append(leg)
+                current_location = leg.to_location
+            
             plan.legs = cleaned
